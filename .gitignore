@@ -5,3 +5,5 @@ node_modules/
 **/.env
 **/.env.*
 .env2
+venv/
+.venv/
