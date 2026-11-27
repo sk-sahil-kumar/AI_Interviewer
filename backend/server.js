@@ -1,3 +1,4 @@
+
 import express from "express";
 import http from "http";
 import dotenv from "dotenv";
@@ -13,32 +14,29 @@ dotenv.config();
 connectDB();
 
 const app = express();
-
 const server = http.createServer(app);
 
 const allowedOrigin = [
-    'http://localhost:5174',
-    'http://localhost:5173',
-]
+    "http://localhost:5173",
+    "http://localhost:5174",
+    "https://myprojectfrontend-k8pkx40gm-sk-sahil-kumar.vercel.app"
+];
 
-const io = new Server(server, {
-    cors: {
-        origin: allowedOrigin,
-        methods: ['GET', 'POST', 'PUT', 'DELETE',  'OPTIONS'],
-        credentials: true,
-        allowedHeaders: ['Content-Type', 'Authorization'],
-    }
-})
-
-app.use(cors({
+const corsOptions = {
     origin: allowedOrigin,
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization',"X-Requested-With"],
-}))
+    allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"]
+};
+
+app.use(cors(corsOptions));
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+const io = new Server(server, {
+    cors: corsOptions
+});
 
 app.set("io", io);
 
@@ -51,9 +49,10 @@ app.use("/api/sessions", sessionRoutes);
 
 io.on("connection", (socket) => {
     console.log(`A user Connected ${socket.id}`);
-    const userId=socket.handshake.query.userId;
-    if(userId){
 
+    const userId = socket.handshake.query.userId;
+
+    if (userId) {
         socket.join(userId);
         console.log(`User ${socket.id} joined room: ${userId}`);
     }
@@ -68,7 +67,6 @@ app.use(errorHandler);
 
 const PORT = process.env.PORT || 5000;
 
-server.listen(
-    PORT,
-    console.log(`Server running in ${process.env.NODE_ENV} mode on port ${PORT}`)
-);
+server.listen(PORT, () => {
+    console.log(`Server running in ${process.env.NODE_ENV} mode on port ${PORT}`);
+});
