@@ -5,14 +5,15 @@ import io
 import json
 import tempfile
 import threading
+import re
 
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from typing import Optional
 
-import ollama
+from ollama import Client
 import whisper
 from pydub import AudioSegment
 
@@ -20,7 +21,28 @@ from pydub import AudioSegment
 load_dotenv()
 
 AI_SERVICE_PORT = int(os.getenv("AI_SERVICE_PORT", 8000))
-OLLAMA_MODEL_NAME = os.getenv("OLLAMA_MODEL_NAME", "mistral")
+
+OLLAMA_MODEL_NAME = os.getenv(
+    "OLLAMA_MODEL_NAME",
+    "mistral-large-4"
+)
+
+OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY")
+
+# Ollama Cloud Client
+ollama_client = Client(
+    host="https://ollama.com",
+    headers={
+        "Authorization": f"Bearer {OLLAMA_API_KEY}"
+    } if OLLAMA_API_KEY else {}
+)
+
+
+def check_ollama_config():
+    if not OLLAMA_API_KEY:
+        raise RuntimeError(
+            "OLLAMA_API_KEY is missing in environment variables"
+        )
 
 
 app = FastAPI(
@@ -54,7 +76,6 @@ def get_whisper_model():
                 print("Loading Whisper tiny.en model...")
 
                 import torch
-
                 torch.set_num_threads(1)
 
                 WHISPER_MODEL = whisper.load_model(
@@ -70,7 +91,7 @@ def get_whisper_model():
 class QuestionResquest(BaseModel):
     role: str = "MERN Stack Developer"
     level: str = "Junior"
-    count: int = 5
+    count: int = Field(default=5, ge=1, le=20)
     interview_type: str = "coding-mix"
 
 
@@ -99,7 +120,8 @@ class EvaluationResponse(BaseModel):
 async def root():
     return {
         "message": "Hello from AI Interviewer Microservice!",
-        "model": OLLAMA_MODEL_NAME
+        "model": OLLAMA_MODEL_NAME,
+        "provider": "Ollama Cloud"
     }
 
 
@@ -107,6 +129,8 @@ async def root():
 async def generate_questions(request: QuestionResquest):
 
     try:
+        check_ollama_config()
+
         if request.interview_type == "coding-mix":
 
             coding_count = int(request.count * 0.2)
@@ -122,7 +146,7 @@ async def generate_questions(request: QuestionResquest):
         else:
             instruction = (
                 "All questions MUST be conceptual oral questions. "
-                "Do NOT generate any coding or implementation challenges."
+                "Do NOT generate coding or implementation challenges."
             )
 
         system_prompt = (
@@ -138,20 +162,26 @@ async def generate_questions(request: QuestionResquest):
             f"for a {request.level} level {request.role}."
         )
 
-        response = ollama.generate(
+        response = ollama_client.generate(
             model=OLLAMA_MODEL_NAME,
             prompt=user_prompt,
             system=system_prompt,
+            stream=False,
             options={"temperature": 0.6}
         )
 
         raw_text = response["response"].strip()
 
         questions = [
-            q.strip()
+            q.strip().lstrip("0123456789. )-")
             for q in raw_text.split("\n")
             if q.strip()
         ]
+
+        questions = [q for q in questions if q]
+
+        if not questions:
+            raise ValueError("No questions were generated")
 
         return QuestionResponse(
             questions=questions[:request.count],
@@ -171,6 +201,12 @@ async def transcribe_audio(file: UploadFile = File(...)):
     try:
         audio_bytes = await file.read()
 
+        if not audio_bytes:
+            raise HTTPException(
+                status_code=400,
+                detail="Uploaded audio file is empty"
+            )
+
         audio_in_memory = io.BytesIO(audio_bytes)
 
         audio_segment = AudioSegment.from_file(audio_in_memory)
@@ -179,7 +215,6 @@ async def transcribe_audio(file: UploadFile = File(...)):
             delete=False,
             suffix=".mp3"
         ) as tmp:
-
             temp_audio_path = tmp.name
 
         audio_segment.export(
@@ -217,15 +252,16 @@ async def transcribe_audio(file: UploadFile = File(...)):
 async def evaluate(request: EvaluationRequest):
 
     try:
+        check_ollama_config()
+
         if request.question_type == "oral":
 
             assessment_instruction = (
                 "This is a conceptual oral question. "
                 "Focus purely on candidate's verbal explanation. "
                 "Ignore any code blocks. "
-                "CRITICAL: If the transcript is empty, nonsense "
-                "(e.g. 'blah blah', 'testing') or irrelevant "
-                "to the question, SCORE 0."
+                "If the transcript is empty, nonsense "
+                "or irrelevant to the question, SCORE 0."
             )
 
         else:
@@ -235,8 +271,8 @@ async def evaluate(request: EvaluationRequest):
                 "Evaluate the code logic and efficiency. "
                 "Use the transcription only for insight into their "
                 "thought process. "
-                "CRITICAL: If the code is 'undefined', empty, "
-                "just random comments, or random characters, SCORE 0."
+                "If the code is undefined, empty, random comments, "
+                "or random characters, SCORE 0."
             )
 
         system_prompt = (
@@ -247,7 +283,8 @@ async def evaluate(request: EvaluationRequest):
             "RULE 2: For idealAnswer, provide a clean Markdown string. "
             "Do NOT return a nested JSON object. "
             f"Context: {assessment_instruction} "
-            "Respond ONLY with a JSON object. "
+            "Respond ONLY with a valid JSON object. "
+            "Do not use Markdown code fences. "
             "Required keys: technicalScore (0-100), "
             "confidenceScore (0-100), aiFeedback, idealAnswer."
         )
@@ -260,61 +297,54 @@ async def evaluate(request: EvaluationRequest):
             f"Code Answer: {request.user_code or 'No code provided'}\n"
         )
 
-        response = ollama.generate(
+        response = ollama_client.generate(
             model=OLLAMA_MODEL_NAME,
             prompt=user_prompt,
             system=system_prompt,
-            format="json",
+            stream=False,
             options={"temperature": 0.1}
         )
 
         response_text = response["response"].strip()
 
-        try:
-            evaluation_data = json.loads(response_text)
+        # Remove Markdown JSON fences if the model returns them.
+        response_text = re.sub(
+            r"^```(?:json)?\s*|\s*```$",
+            "",
+            response_text,
+            flags=re.IGNORECASE
+        ).strip()
 
-            if (
-                "idealAnswer" in evaluation_data
-                and not isinstance(evaluation_data["idealAnswer"], str)
-            ):
-                evaluation_data["idealAnswer"] = json.dumps(
-                    evaluation_data["idealAnswer"]
-                )
+        # Extract JSON object if extra text is returned.
+        start = response_text.find("{")
+        end = response_text.rfind("}")
 
-            return EvaluationResponse(**evaluation_data)
+        if start == -1 or end == -1:
+            raise ValueError("AI did not return a valid JSON object")
 
-        except json.JSONDecodeError:
+        response_text = response_text[start:end + 1]
 
-            import re
+        evaluation_data = json.loads(response_text)
 
-            fixed_text = re.sub(
-                r"[\r\n\t]",
-                " ",
-                response_text
+        # Ensure idealAnswer is a string.
+        if not isinstance(evaluation_data.get("idealAnswer"), str):
+            evaluation_data["idealAnswer"] = json.dumps(
+                evaluation_data.get("idealAnswer", ""),
+                ensure_ascii=False
             )
 
-            try:
-                evaluation_data = json.loads(fixed_text)
+        # Validate and limit scores.
+        evaluation_data["technicalScore"] = max(
+            0,
+            min(100, int(evaluation_data["technicalScore"]))
+        )
 
-                if (
-                    "idealAnswer" in evaluation_data
-                    and not isinstance(evaluation_data["idealAnswer"], str)
-                ):
-                    evaluation_data["idealAnswer"] = json.dumps(
-                        evaluation_data["idealAnswer"]
-                    )
+        evaluation_data["confidenceScore"] = max(
+            0,
+            min(100, int(evaluation_data["confidenceScore"]))
+        )
 
-                return EvaluationResponse(**evaluation_data)
-
-            except Exception:
-                print(f"Failed to parse response: {response_text}")
-
-                return EvaluationResponse(
-                    technicalScore=0,
-                    confidenceScore=0,
-                    aiFeedback="Failed to parse response",
-                    idealAnswer="Failed to parse response"
-                )
+        return EvaluationResponse(**evaluation_data)
 
     except Exception as e:
         print(f"Failed to generate evaluation: {e}")
